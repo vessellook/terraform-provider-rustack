@@ -14,6 +14,7 @@ func resourcePaasService() *schema.Resource {
 	return &schema.Resource{
 		ReadContext:   resourcePaasServiceRead,
 		CreateContext: resourcePaasServiceCreate,
+		UpdateContext: resourcePaasServiceUpdate,
 		DeleteContext: resourcePaasServiceDelete,
 		Importer: &schema.ResourceImporter{
 			StateContext: schema.ImportStatePassthroughContext,
@@ -31,14 +32,13 @@ func resourcePaasService() *schema.Resource {
 			"name": {
 				Type:        schema.TypeString,
 				Required:    true,
-				ForceNew:    true,
 				Description: "name of Paas Service at BCC",
 			},
-			"project_id": {
+			"vdc_id": {
 				Type:        schema.TypeString,
 				Required:    true,
 				ForceNew:    true,
-				Description: "id of Project",
+				Description: "id of Vdc",
 			},
 			"paas_service_id": {
 				Type:        schema.TypeInt,
@@ -49,15 +49,43 @@ func resourcePaasService() *schema.Resource {
 			"paas_service_inputs": {
 				Type:        schema.TypeString,
 				Required:    true,
-				ForceNew:    true,
 				Description: "inputs of Paas Service as JSON object",
 			},
 		},
 	}
 }
 
+func ensureLocationCreated(vdcId string, manager *bcc.Manager) error {
+	vdc, err := manager.GetVdc(vdcId)
+	if err != nil {
+		return err
+	}
+	if vdc.Paas != nil {
+		return nil
+	}
+	err = manager.CreatePaasLocation(vdcId)
+	if err != nil {
+		return err
+	}
+	for {
+		vdc, err := manager.GetVdc(vdcId)
+		if err != nil {
+			return err
+		}
+		if vdc.Paas != nil && !vdc.Paas.Locked {
+			return nil
+		}
+		time.Sleep(time.Second)
+	}
+}
+
 func resourcePaasServiceRead(ctx context.Context, d *schema.ResourceData, meta interface{}) (diagErr diag.Diagnostics) {
 	manager := meta.(*CombinedConfig).Manager()
+	manager = manager.WithContext(ctx)
+	err := ensureLocationCreated(d.Get("vdc_id").(string), manager)
+	if err != nil {
+		return diag.FromErr(err)
+	}
 	service, err := manager.GetPaasService(d.Get("id").(string))
 	if err != nil {
 		if err.(*bcc.ApiError).Code() == 404 {
@@ -69,7 +97,7 @@ func resourcePaasServiceRead(ctx context.Context, d *schema.ResourceData, meta i
 	}
 	d.Set("id", service.ID)
 	d.Set("name", service.Name)
-	d.Set("project_id", service.Project.ID)
+	d.Set("vdc_id", service.Vdc.ID)
 	d.Set("paas_service_id", service.PaasServiceID)
 	inputsString, err := json.Marshal(service.Inputs)
 	if err != nil {
@@ -82,6 +110,11 @@ func resourcePaasServiceRead(ctx context.Context, d *schema.ResourceData, meta i
 
 func resourcePaasServiceCreate(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {
 	manager := meta.(*CombinedConfig).Manager()
+	manager = manager.WithContext(ctx)
+	err := ensureLocationCreated(d.Get("vdc_id").(string), manager)
+	if err != nil {
+		return diag.FromErr(err)
+	}
 	var inputs map[string]interface{}
 	inputsString := d.Get("paas_service_inputs").(string)
 	if err := json.Unmarshal([]byte(inputsString), &inputs); err != nil {
@@ -89,11 +122,11 @@ func resourcePaasServiceCreate(ctx context.Context, d *schema.ResourceData, meta
 	}
 	service := &bcc.PaasService{
 		Name: d.Get("name").(string),
-		Project: struct {
+		Vdc: struct {
 			ID   string `json:"id"`
 			Name string `json:"name"`
 		}{
-			ID: d.Get("project_id").(string),
+			ID: d.Get("vdc_id").(string),
 		},
 		PaasServiceID: d.Get("paas_service_id").(int),
 		Inputs:        inputs,
@@ -101,15 +134,52 @@ func resourcePaasServiceCreate(ctx context.Context, d *schema.ResourceData, meta
 	if err := manager.CreatePaasService(service); err != nil {
 		return diag.Errorf("Error creating Paas Service: %s", err)
 	}
+	service.WaitLock()
 	d.Set("id", service.ID)
+	return resourcePaasServiceRead(ctx, d, meta)
+}
+
+func resourcePaasServiceUpdate(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {
+	manager := meta.(*CombinedConfig).Manager()
+	manager = manager.WithContext(ctx)
+	err := ensureLocationCreated(d.Get("vdc_id").(string), manager)
+	if err != nil {
+		return diag.FromErr(err)
+	}
+	service, err := manager.GetPaasService(d.Id())
+	if err != nil {
+		return diag.Errorf("id: Error getting paas service: %s", err)
+	}
+	var inputs map[string]interface{}
+	inputsString := d.Get("paas_service_inputs").(string)
+	if err := json.Unmarshal([]byte(inputsString), &inputs); err != nil {
+		return diag.Errorf("Error parsing Paas Service inputs: %s", err)
+	}
+	service.Inputs = inputs	
+	service.Name = d.Get("name").(string)
+	if err := service.Update(); err != nil {
+		return diag.Errorf("Error updating Paas Service: %s", err)
+	}
+	service.WaitLock()
+
 	return resourcePaasServiceRead(ctx, d, meta)
 }
 
 func resourcePaasServiceDelete(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {
 	manager := meta.(*CombinedConfig).Manager()
-	err := manager.DeletePaasService(d.Get("id").(string))
+	manager = manager.WithContext(ctx)
+	err := ensureLocationCreated(d.Get("vdc_id").(string), manager)
+	if err != nil {
+		return diag.FromErr(err)
+	}
+	service, err := manager.GetPaasService(d.Get("id").(string))
+	if err != nil {
+		return diag.FromErr(err)
+	}
+	err = manager.DeletePaasService(d.Get("id").(string))
 	if err != nil {
 		return diag.Errorf("Error deleting Paas Service: %s", err)
 	}
+	service.WaitLock()
 	return nil
 }
